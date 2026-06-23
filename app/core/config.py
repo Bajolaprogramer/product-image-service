@@ -36,10 +36,12 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # --- External providers (reserved for future image-retrieval work) ------
-    external_api_base_url: str = ""
+    # --- External providers --------------------------------------------------
     external_api_key: str = ""
     external_api_timeout_seconds: float = 10.0
+
+    # Open Food Facts public API root.
+    open_food_facts_base_url: str = "https://world.openfoodfacts.org"
 
 
 @lru_cache
