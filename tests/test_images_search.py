@@ -1,21 +1,21 @@
 """Tests for the product image search endpoint (POST /api/v1/images/search).
 
-The barcode path now calls Open Food Facts, so endpoint tests that use a barcode
-override the service dependency with one backed by a mocked HTTP transport — no
-real network calls are made. SKU-only searches still use built-in mock data.
+The barcode path fans out across providers, so endpoint tests that use a barcode
+override the service dependency with one whose registry contains stub providers
+— no real network calls are made. SKU-only searches still use built-in mock data.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.clients.open_food_facts_client import OpenFoodFactsClient
 from app.main import create_app
-from app.models.product_image import ImageSource, SearchStatus
+from app.models.product_image import ImageSource, ProductImage, SearchStatus
+from app.providers.base_provider import ImageProvider
+from app.providers.registry import ProviderRegistry
 from app.services.product_image_service import (
     ProductImageService,
     get_product_image_service,
@@ -24,31 +24,34 @@ from app.services.product_image_service import (
 SEARCH_URL = "/api/v1/images/search"
 BARCODE = "3017620422003"
 
-PRODUCT_FOUND_BODY = {
-    "status": 1,
-    "product": {
-        "image_front_url": "https://images.openfoodfacts.org/3017620422003/front.jpg",
-        "image_ingredients_url": "https://images.openfoodfacts.org/3017620422003/ing.jpg",
-    },
-}
 
+class _StubProvider(ImageProvider):
+    """Provider returning canned Open Food Facts-sourced images."""
 
-def _service_with_mocked_off(body: dict, status_code: int = 200) -> ProductImageService:
-    """Build a service whose Open Food Facts client returns a canned response."""
+    name = "stub"
 
-    transport = httpx.MockTransport(lambda _req: httpx.Response(status_code, json=body))
-    http_client = httpx.AsyncClient(transport=transport, base_url="https://test")
-    off_client = OpenFoodFactsClient(base_url="https://test", http_client=http_client)
-    return ProductImageService(open_food_facts_client=off_client)
+    async def search_images(self, barcode: str) -> list[ProductImage]:
+        return [
+            ProductImage(
+                image_url=f"https://off.example.com/{barcode}/front.jpg",
+                source=ImageSource.OPEN_FOOD_FACTS,
+                relevance_score=1.0,
+            ),
+            ProductImage(
+                image_url=f"https://off.example.com/{barcode}/ing.jpg",
+                source=ImageSource.OPEN_FOOD_FACTS,
+                relevance_score=0.9,
+            ),
+        ]
 
 
 @pytest.fixture
 def barcode_client() -> Iterator[TestClient]:
-    """A ``TestClient`` whose service resolves barcodes from a mocked provider."""
+    """A ``TestClient`` whose service resolves barcodes from a stub provider."""
 
     app = create_app()
-    app.dependency_overrides[get_product_image_service] = (
-        lambda: _service_with_mocked_off(PRODUCT_FOUND_BODY)
+    app.dependency_overrides[get_product_image_service] = lambda: ProductImageService(
+        registry=ProviderRegistry([_StubProvider()])
     )
     with TestClient(app) as test_client:
         yield test_client
@@ -56,7 +59,7 @@ def barcode_client() -> Iterator[TestClient]:
 
 
 def test_search_by_barcode(barcode_client: TestClient) -> None:
-    """A barcode search succeeds and returns Open Food Facts images."""
+    """A barcode search succeeds and returns aggregated provider images."""
 
     response = barcode_client.post(SEARCH_URL, json={"barcode": BARCODE})
 
