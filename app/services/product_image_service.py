@@ -183,15 +183,20 @@ def get_product_image_service() -> ProductImageService:
     from app.core.config import get_settings
     from app.providers.mock_provider import MockProvider
     from app.providers.open_food_facts_provider import OpenFoodFactsProvider
+    from app.resilience.circuit_breaker import CircuitBreaker
 
     settings = get_settings()
     off_client = OpenFoodFactsClient(
         base_url=settings.open_food_facts_base_url,
         timeout=settings.external_api_timeout_seconds,
     )
+    off_breaker = CircuitBreaker(
+        failure_threshold=settings.circuit_breaker_failure_threshold,
+        recovery_timeout_seconds=settings.circuit_breaker_recovery_timeout_seconds,
+    )
     registry = ProviderRegistry(
         [
-            OpenFoodFactsProvider(client=off_client),
+            OpenFoodFactsProvider(client=off_client, circuit_breaker=off_breaker),
             MockProvider(),
         ]
     )

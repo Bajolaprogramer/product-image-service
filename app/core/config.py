@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     # Open Food Facts public API root.
     open_food_facts_base_url: str = "https://world.openfoodfacts.org"
 
+    # --- Resilience (circuit breaker) ---------------------------------------
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_recovery_timeout_seconds: float = 30.0
+
 
 @lru_cache
 def get_settings() -> Settings:
