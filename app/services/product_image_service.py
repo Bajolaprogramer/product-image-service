@@ -1,27 +1,21 @@
 """Business logic for product image retrieval.
 
-The :class:`ProductImageService` orchestrates a search: it selects an identifier,
-delegates provider communication to clients, converts normalized provider data
-into domain :class:`ProductImage` models, and shapes the response.
+The :class:`ProductImageService` aggregates results across multiple providers.
+For a barcode it queries every active provider concurrently, merges their
+images, removes duplicate URLs (keeping the highest-scoring instance), and ranks
+the result by relevance. SKU lookups still use mock data until a SKU-capable
+provider exists.
 
-Provider integration status:
-
-* **barcode** — backed by the real :class:`OpenFoodFactsClient`.
-* **sku** — still returns mock data until a SKU-capable provider is added.
-
-The service contains **no** raw HTTP logic; all network access lives in the
-clients layer. Provider failures are caught here and translated into a graceful
-``FAILED`` response so the API never crashes.
+The service holds **no** HTTP or provider-specific logic — providers (and the
+clients beneath them) own that. Provider failures are tolerated: the service
+degrades to ``PARTIAL_SUCCESS`` or ``FAILED`` rather than raising, so the API
+never crashes.
 """
 
 from __future__ import annotations
 
-from app.clients.open_food_facts_client import (
-    OpenFoodFactsClient,
-    OpenFoodFactsError,
-    OpenFoodFactsImage,
-    ProductNotFoundError,
-)
+import asyncio
+
 from app.models.product_image import (
     ImageSource,
     ProductImage,
@@ -29,35 +23,35 @@ from app.models.product_image import (
     ProductImageSearchResponse,
     SearchStatus,
 )
+from app.providers.registry import ProviderRegistry
 
 
 class ProductImageService:
-    """Coordinates product image searches across providers.
+    """Coordinates multi-provider product image searches.
 
-    The service is async-ready and stateless aside from its injected clients,
-    so it can be constructed per-request and injected into routes via FastAPI's
-    dependency system. Injecting the client keeps the service unit-testable
-    without real network access.
+    The service is async-first and depends only on a :class:`ProviderRegistry`,
+    so it is easy to construct with real or fake providers and to inject into
+    routes via FastAPI's dependency system.
     """
 
-    def __init__(self, open_food_facts_client: OpenFoodFactsClient | None = None) -> None:
-        """Wire the service with its provider clients.
+    def __init__(self, registry: ProviderRegistry | None = None) -> None:
+        """Wire the service with its provider registry.
 
         Args:
-            open_food_facts_client: Client used for barcode lookups. Defaults to
-                a client targeting the public API; inject a configured or fake
-                client for production settings and tests.
+            registry: Source of active providers. Defaults to an empty registry
+                (useful in isolation); production wiring supplies a populated
+                one via :func:`get_product_image_service`.
         """
 
-        self._off_client = open_food_facts_client or OpenFoodFactsClient()
+        self._registry = registry or ProviderRegistry()
 
     async def search(
         self, request: ProductImageSearchRequest
     ) -> ProductImageSearchResponse:
         """Search for product images matching the given identifiers.
 
-        Barcode lookups take precedence and hit the real provider; SKU-only
-        requests fall back to mock data for now.
+        Barcode lookups fan out across all providers; SKU-only requests fall
+        back to mock data for now.
 
         Args:
             request: Validated search request containing a barcode and/or SKU.
@@ -74,24 +68,37 @@ class ProductImageService:
         return await self._search_by_sku(request.sku.strip())
 
     async def _search_by_barcode(self, barcode: str) -> ProductImageSearchResponse:
-        """Look up images for a barcode via Open Food Facts.
+        """Query all providers concurrently and aggregate their images.
 
-        Any provider failure (not found, timeout, malformed response) is caught
-        and reported as an empty ``FAILED`` result — the endpoint never raises.
+        Status is derived from both the merged image set and whether any
+        provider failed:
+
+        * ``SUCCESS`` — images found and every provider succeeded.
+        * ``PARTIAL_SUCCESS`` — images found but at least one provider failed.
+        * ``FAILED`` — no images found (including the all-providers-failed case).
         """
 
-        try:
-            raw_images = await self._off_client.fetch_images_by_barcode(barcode)
-        except ProductNotFoundError:
-            raw_images = []
-        except OpenFoodFactsError:
-            # Timeouts, connection errors, malformed responses, non-2xx, etc.
-            raw_images = []
+        providers = self._registry.get_active_providers()
 
-        images = self._to_product_images(raw_images)
+        results = await asyncio.gather(
+            *(provider.search_images(barcode) for provider in providers),
+            return_exceptions=True,
+        )
+
+        collected: list[ProductImage] = []
+        had_failure = False
+        for result in results:
+            if isinstance(result, Exception):
+                had_failure = True
+                continue
+            collected.extend(result)
+
+        images = self._merge_and_rank(collected)
+        status = self._resolve_status(images=images, had_failure=had_failure)
+
         return ProductImageSearchResponse(
             query=barcode,
-            status=SearchStatus.SUCCESS if images else SearchStatus.FAILED,
+            status=status,
             images=images,
             total_images=len(images),
         )
@@ -99,7 +106,7 @@ class ProductImageService:
     async def _search_by_sku(self, sku: str) -> ProductImageSearchResponse:
         """Return mock images for a SKU.
 
-        Placeholder until a SKU-capable provider client is introduced; the async
+        Placeholder until a SKU-capable provider is introduced; the async
         signature means that swap will not change callers.
         """
 
@@ -112,28 +119,35 @@ class ProductImageService:
         )
 
     @staticmethod
-    def _to_product_images(
-        raw_images: list[OpenFoodFactsImage],
-    ) -> list[ProductImage]:
-        """Convert normalized provider images into domain models.
+    def _merge_and_rank(images: list[ProductImage]) -> list[ProductImage]:
+        """De-duplicate by URL and sort by relevance descending.
 
-        Relevance is approximated by position: providers tend to return the most
-        representative image (the product front) first, so earlier images score
-        higher. This keeps the contract meaningful until real ranking exists.
+        When the same URL is reported by more than one provider, the
+        highest-scoring instance wins. Ties preserve first-seen order (stable
+        sort), keeping output deterministic.
         """
 
-        product_images: list[ProductImage] = []
-        for index, image in enumerate(raw_images):
-            product_images.append(
-                ProductImage(
-                    image_url=image.url,
-                    source=ImageSource.OPEN_FOOD_FACTS,
-                    relevance_score=max(0.1, round(1.0 - index * 0.1, 2)),
-                    width=image.width,
-                    height=image.height,
-                )
-            )
-        return product_images
+        best_by_url: dict[str, ProductImage] = {}
+        for image in images:
+            existing = best_by_url.get(image.image_url)
+            if existing is None or image.relevance_score > existing.relevance_score:
+                best_by_url[image.image_url] = image
+
+        return sorted(
+            best_by_url.values(),
+            key=lambda image: image.relevance_score,
+            reverse=True,
+        )
+
+    @staticmethod
+    def _resolve_status(
+        *, images: list[ProductImage], had_failure: bool
+    ) -> SearchStatus:
+        """Map aggregation outcome to a :class:`SearchStatus`."""
+
+        if not images:
+            return SearchStatus.FAILED
+        return SearchStatus.PARTIAL_SUCCESS if had_failure else SearchStatus.SUCCESS
 
     @staticmethod
     def _mock_images(query: str) -> list[ProductImage]:
@@ -158,18 +172,27 @@ class ProductImageService:
 
 
 def get_product_image_service() -> ProductImageService:
-    """Provide a :class:`ProductImageService` instance.
+    """Provide a fully wired :class:`ProductImageService`.
 
-    Used as a FastAPI dependency so routes stay decoupled from construction and
-    tests can override it via ``app.dependency_overrides``. The Open Food Facts
-    client is configured from application settings.
+    Builds the active provider set (Open Food Facts + mock second source) from
+    application settings. Used as a FastAPI dependency so routes stay decoupled
+    from construction and tests can override it via ``app.dependency_overrides``.
     """
 
+    from app.clients.open_food_facts_client import OpenFoodFactsClient
     from app.core.config import get_settings
+    from app.providers.mock_provider import MockProvider
+    from app.providers.open_food_facts_provider import OpenFoodFactsProvider
 
     settings = get_settings()
     off_client = OpenFoodFactsClient(
         base_url=settings.open_food_facts_base_url,
         timeout=settings.external_api_timeout_seconds,
     )
-    return ProductImageService(open_food_facts_client=off_client)
+    registry = ProviderRegistry(
+        [
+            OpenFoodFactsProvider(client=off_client),
+            MockProvider(),
+        ]
+    )
+    return ProductImageService(registry=registry)

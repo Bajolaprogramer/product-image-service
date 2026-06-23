@@ -1,7 +1,8 @@
-"""Tests for the Open Food Facts client and its service integration.
+"""Tests for the Open Food Facts HTTP client.
 
-HTTP is faked with ``httpx.MockTransport`` so the real parsing, error handling,
-and service-to-domain mapping run end to end without network access.
+HTTP is faked with ``httpx.MockTransport`` so the real request building, status
+handling, and JSON parsing run without network access. Provider-level mapping
+and service aggregation are covered in ``test_providers.py``.
 """
 
 from __future__ import annotations
@@ -17,16 +18,9 @@ from app.clients.open_food_facts_client import (
     OpenFoodFactsTimeoutError,
     ProductNotFoundError,
 )
-from app.models.product_image import (
-    ImageSource,
-    ProductImageSearchRequest,
-    SearchStatus,
-)
-from app.services.product_image_service import ProductImageService
 
 BARCODE = "3017620422003"
 
-# A trimmed-but-realistic Open Food Facts "product found" payload.
 PRODUCT_FOUND_BODY = {
     "code": BARCODE,
     "status": 1,
@@ -52,7 +46,9 @@ PRODUCT_NO_IMAGES_BODY = {
 }
 
 
-def _client_with(handler: Callable[[httpx.Request], httpx.Response]) -> OpenFoodFactsClient:
+def _client_with(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> OpenFoodFactsClient:
     """Build an ``OpenFoodFactsClient`` whose HTTP is driven by ``handler``."""
 
     transport = httpx.MockTransport(handler)
@@ -60,9 +56,6 @@ def _client_with(handler: Callable[[httpx.Request], httpx.Response]) -> OpenFood
     return OpenFoodFactsClient(base_url="https://test", http_client=http_client)
 
 
-# --------------------------------------------------------------------------- #
-# Client-level tests
-# --------------------------------------------------------------------------- #
 async def test_client_parses_successful_response() -> None:
     """A 'product found' payload yields de-duplicated normalized images."""
 
@@ -134,83 +127,3 @@ async def test_client_raises_on_server_error() -> None:
 
     with pytest.raises(OpenFoodFactsResponseError):
         await client.fetch_images_by_barcode(BARCODE)
-
-
-# --------------------------------------------------------------------------- #
-# Service-level integration tests
-# --------------------------------------------------------------------------- #
-async def test_service_barcode_success_maps_domain_models() -> None:
-    """A successful lookup produces SUCCESS with Open Food Facts domain images."""
-
-    service = ProductImageService(
-        open_food_facts_client=_client_with(
-            lambda _req: httpx.Response(200, json=PRODUCT_FOUND_BODY)
-        )
-    )
-
-    response = await service.search(ProductImageSearchRequest(barcode=BARCODE))
-
-    assert response.query == BARCODE
-    assert response.status == SearchStatus.SUCCESS
-    assert response.total_images == len(response.images) == 3
-    assert all(img.source == ImageSource.OPEN_FOOD_FACTS for img in response.images)
-    # Position-based relevance: first image ranks highest.
-    assert response.images[0].relevance_score == 1.0
-    assert response.images[1].relevance_score < response.images[0].relevance_score
-
-
-async def test_service_barcode_not_found_is_failed() -> None:
-    """Product-not-found yields a graceful empty FAILED response."""
-
-    service = ProductImageService(
-        open_food_facts_client=_client_with(
-            lambda _req: httpx.Response(200, json=PRODUCT_NOT_FOUND_BODY)
-        )
-    )
-
-    response = await service.search(ProductImageSearchRequest(barcode=BARCODE))
-
-    assert response.status == SearchStatus.FAILED
-    assert response.images == []
-    assert response.total_images == 0
-
-
-async def test_service_barcode_no_images_is_failed() -> None:
-    """A found product with no images yields FAILED (no images located)."""
-
-    service = ProductImageService(
-        open_food_facts_client=_client_with(
-            lambda _req: httpx.Response(200, json=PRODUCT_NO_IMAGES_BODY)
-        )
-    )
-
-    response = await service.search(ProductImageSearchRequest(barcode=BARCODE))
-
-    assert response.status == SearchStatus.FAILED
-    assert response.total_images == 0
-
-
-async def test_service_never_crashes_on_client_error() -> None:
-    """A provider timeout is swallowed into a FAILED response, not an exception."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.TimeoutException("timed out", request=request)
-
-    service = ProductImageService(open_food_facts_client=_client_with(handler))
-
-    response = await service.search(ProductImageSearchRequest(barcode=BARCODE))
-
-    assert response.status == SearchStatus.FAILED
-    assert response.images == []
-
-
-async def test_service_sku_still_uses_mock() -> None:
-    """SKU-only searches keep returning mock data for now."""
-
-    service = ProductImageService()
-
-    response = await service.search(ProductImageSearchRequest(sku="SKU-12345"))
-
-    assert response.query == "SKU-12345"
-    assert response.status == SearchStatus.SUCCESS
-    assert len(response.images) >= 2
