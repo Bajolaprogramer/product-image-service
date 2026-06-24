@@ -1,0 +1,38 @@
+name: Docker Build
+
+# Build-only pipeline (no push/deploy) gated on the develop branch.
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+
+concurrency:
+  group: docker-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        # Equivalent to: docker build -t product-image-service .
+        # push: false keeps this build-only; a failed build fails the workflow.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: |
+            product-image-service:latest
+            product-image-service:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
