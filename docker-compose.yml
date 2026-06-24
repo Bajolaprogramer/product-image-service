@@ -1,0 +1,25 @@
+# Local development orchestration for the Product Image Service.
+# Usage: docker compose up --build
+services:
+  product-image-service:
+    build: .
+    container_name: product-image-service
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # Load configuration from .env when present. All settings have sane
+    # defaults, so the file is optional (copy .env.example to .env to override).
+    env_file:
+      - path: .env
+        required: false
+    # Mirror the image's healthcheck so `docker compose ps` reports health.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
