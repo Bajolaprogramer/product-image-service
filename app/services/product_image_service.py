@@ -26,6 +26,7 @@ from app.models.product_image import (
 from app.observability import metrics
 from app.providers.registry import ProviderRegistry
 from app.resilience.circuit_breaker import CircuitOpenError
+from app.services.event_sink import NullEventSink, SearchEventSink
 
 
 class ProductImageService:
@@ -36,16 +37,25 @@ class ProductImageService:
     routes via FastAPI's dependency system.
     """
 
-    def __init__(self, registry: ProviderRegistry | None = None) -> None:
-        """Wire the service with its provider registry.
+    def __init__(
+        self,
+        registry: ProviderRegistry | None = None,
+        event_sink: SearchEventSink | None = None,
+    ) -> None:
+        """Wire the service with its provider registry and event sink.
 
         Args:
             registry: Source of active providers. Defaults to an empty registry
                 (useful in isolation); production wiring supplies a populated
                 one via :func:`get_product_image_service`.
+            event_sink: Optional sink notified of provider failures and
+                circuit-open rejections. Defaults to a no-op so the service has
+                no messaging dependency. The Kafka processor injects a sink that
+                publishes the corresponding events.
         """
 
         self._registry = registry or ProviderRegistry()
+        self._event_sink: SearchEventSink = event_sink or NullEventSink()
 
     async def search(
         self, request: ProductImageSearchRequest
@@ -98,8 +108,14 @@ class ProductImageService:
             if isinstance(result, Exception):
                 had_failure = True
                 metrics.record_provider_failure(provider.name)
+                self._event_sink.on_provider_failure(
+                    provider=provider.name, query=barcode, error=repr(result)
+                )
                 if isinstance(result, CircuitOpenError):
                     metrics.record_circuit_open(provider.name)
+                    self._event_sink.on_circuit_open(
+                        provider=provider.name, query=barcode
+                    )
                 continue
             collected.extend(result)
 
@@ -181,13 +197,8 @@ class ProductImageService:
         ]
 
 
-def get_product_image_service() -> ProductImageService:
-    """Provide a fully wired :class:`ProductImageService`.
-
-    Builds the active provider set (Open Food Facts + mock second source) from
-    application settings. Used as a FastAPI dependency so routes stay decoupled
-    from construction and tests can override it via ``app.dependency_overrides``.
-    """
+def build_default_registry() -> ProviderRegistry:
+    """Build the production provider set (Open Food Facts + mock) from settings."""
 
     from app.clients.open_food_facts_client import OpenFoodFactsClient
     from app.core.config import get_settings
@@ -204,10 +215,32 @@ def get_product_image_service() -> ProductImageService:
         failure_threshold=settings.circuit_breaker_failure_threshold,
         recovery_timeout_seconds=settings.circuit_breaker_recovery_timeout_seconds,
     )
-    registry = ProviderRegistry(
+    return ProviderRegistry(
         [
             OpenFoodFactsProvider(client=off_client, circuit_breaker=off_breaker),
             MockProvider(),
         ]
     )
-    return ProductImageService(registry=registry)
+
+
+def build_product_image_service(
+    event_sink: SearchEventSink | None = None,
+) -> ProductImageService:
+    """Build a fully wired service, optionally with an event sink.
+
+    Used by the Kafka processor (which injects a sink that publishes provider /
+    circuit-breaker events) and by the REST dependency below.
+    """
+
+    return ProductImageService(registry=build_default_registry(), event_sink=event_sink)
+
+
+def get_product_image_service() -> ProductImageService:
+    """Provide a fully wired :class:`ProductImageService`.
+
+    Used as a FastAPI dependency so routes stay decoupled from construction and
+    tests can override it via ``app.dependency_overrides``. The REST path runs
+    without any messaging dependency (no event sink).
+    """
+
+    return build_product_image_service()

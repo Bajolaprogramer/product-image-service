@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     circuit_breaker_failure_threshold: int = 5
     circuit_breaker_recovery_timeout_seconds: float = 30.0
 
+    # --- Kafka (event-driven processing) ------------------------------------
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_consumer_group_id: str = "product-image-service"
+    kafka_auto_offset_reset: str = "earliest"
+
 
 @lru_cache
 def get_settings() -> Settings:

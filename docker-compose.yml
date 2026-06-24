@@ -13,6 +13,10 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      - kafka
     # Mirror the image's healthcheck so `docker compose ps` reports health.
     healthcheck:
       test:
@@ -24,6 +28,51 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Event-driven worker: consumes image-search-requested, runs the search,
+  # publishes image-search-completed / image-search-failed. Same image, run as
+  # the processor module instead of the API server.
+  search-processor:
+    build: .
+    container_name: search-processor
+    restart: unless-stopped
+    command: ["python", "-m", "app.kafka.processor"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      - kafka
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      # Host access (e.g. local tooling) on localhost:9092.
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Internal listener (kafka:29092) for compose services; host listener
+      # (localhost:9092) for tooling on the host.
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
   prometheus:
     image: prom/prometheus:latest
