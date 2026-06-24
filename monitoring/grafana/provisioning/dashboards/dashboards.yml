@@ -1,0 +1,13 @@
+# Tells Grafana to load dashboard JSON files from disk on startup.
+apiVersion: 1
+
+providers:
+  - name: product-image-service
+    orgId: 1
+    folder: Product Image Service
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

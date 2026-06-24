@@ -7,8 +7,9 @@ factory pattern keeps wiring explicit and dependency-injection friendly.
 
 from fastapi import FastAPI
 
-from app.api.routes import health, images
+from app.api.routes import health, images, metrics
 from app.core.config import Settings, get_settings
+from app.observability.middleware import PrometheusMiddleware
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -37,9 +38,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/openapi.json",
     )
 
+    # Record request count, latency, and status codes for every request.
+    app.add_middleware(PrometheusMiddleware, metrics_path="/metrics")
+
     # Register routers. New domain routers get included here.
     app.include_router(health.router)
     app.include_router(images.router)
+    app.include_router(metrics.router)
 
     return app
 
