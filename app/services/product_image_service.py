@@ -23,7 +23,9 @@ from app.models.product_image import (
     ProductImageSearchResponse,
     SearchStatus,
 )
+from app.observability import metrics
 from app.providers.registry import ProviderRegistry
+from app.resilience.circuit_breaker import CircuitOpenError
 
 
 class ProductImageService:
@@ -60,12 +62,17 @@ class ProductImageService:
             A populated :class:`ProductImageSearchResponse`.
         """
 
-        if request.barcode and request.barcode.strip():
-            return await self._search_by_barcode(request.barcode.strip())
+        metrics.record_search_request()
 
-        # Request validation guarantees a SKU is present when barcode is absent.
-        assert request.sku is not None
-        return await self._search_by_sku(request.sku.strip())
+        if request.barcode and request.barcode.strip():
+            response = await self._search_by_barcode(request.barcode.strip())
+        else:
+            # Request validation guarantees a SKU is present when barcode is absent.
+            assert request.sku is not None
+            response = await self._search_by_sku(request.sku.strip())
+
+        metrics.record_search_status(response.status)
+        return response
 
     async def _search_by_barcode(self, barcode: str) -> ProductImageSearchResponse:
         """Query all providers concurrently and aggregate their images.
@@ -87,9 +94,12 @@ class ProductImageService:
 
         collected: list[ProductImage] = []
         had_failure = False
-        for result in results:
+        for provider, result in zip(providers, results):
             if isinstance(result, Exception):
                 had_failure = True
+                metrics.record_provider_failure(provider.name)
+                if isinstance(result, CircuitOpenError):
+                    metrics.record_circuit_open(provider.name)
                 continue
             collected.extend(result)
 

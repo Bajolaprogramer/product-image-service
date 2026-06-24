@@ -1,0 +1,17 @@
+# Prometheus scrape configuration for the Product Image Service stack.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # The application exposes Prometheus metrics at /metrics.
+  - job_name: product-image-service
+    metrics_path: /metrics
+    static_configs:
+      # Resolvable via the Docker Compose network by service name.
+      - targets: ["product-image-service:8000"]
+
+  # Prometheus scraping itself (useful for debugging the monitoring stack).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
